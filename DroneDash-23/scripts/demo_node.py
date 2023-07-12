@@ -1,0 +1,146 @@
+#! /usr/bin/env python
+
+import math
+import time
+import rospy
+import tf
+from geometry_msgs.msg import PoseStamped, Quaternion
+from mavros_msgs.msg import State
+from mavros_msgs.srv import CommandBool, CommandBoolRequest, SetMode, SetModeRequest
+
+
+from sensor_msgs.msg import Image
+import cv2
+import numpy as np
+from ros_numpy import numpify
+
+class Graph_node:
+    
+    def __init__(self, value, position, neighbour) -> None:
+         self.Value = value
+         self.Position = position
+         self.Neighbour = neighbour
+
+class ImageSubscriber:
+	def __init__(self):
+		self.image_sub = rospy.Subscriber('/camera/depth/image_raw', Image, self.callback)
+
+	def callback(self, msg):
+		try:
+			# Convert the image message to a NumPy array
+			img_np = np.frombuffer(msg.data, dtype=np.float64).reshape(msg.height, msg.width, 1)
+		except Exception as e:
+			rospy.logerr(e)
+			return
+
+		# Display the image using OpenCV
+		cv2.imshow('Image', cv2.normalize(img_np, None, 1, 0, cv2.NORM_MINMAX, dtype=cv2.CV_32FC1))
+		cv2.waitKey(1)
+
+
+
+def Quat(angles):
+    return Quaternion(*tf.transformations.quaternion_from_euler(angles[0], angles[1], angles[2]))
+
+current_state = State()
+
+def state_cb(msg):
+    global current_state
+    current_state = msg
+
+
+if __name__ == "__main__":
+    rospy.init_node("offb_node_py")
+    # rospy.init_node('image_subscriber', anonymous=True)
+
+    state_sub = rospy.Subscriber("mavros/state", State, callback = state_cb)
+    # image_subscriber = ImageSubscriber()
+    
+    local_pos_pub = rospy.Publisher("mavros/setpoint_position/local", PoseStamped, queue_size=1)
+
+    rospy.wait_for_service("/mavros/cmd/arming")
+    arming_client = rospy.ServiceProxy("mavros/cmd/arming", CommandBool)
+
+    rospy.wait_for_service("/mavros/set_mode")
+    set_mode_client = rospy.ServiceProxy("mavros/set_mode", SetMode)
+
+
+    # Setpoint publishing MUST be faster than 2Hz
+    rate = rospy.Rate(20)
+
+    # Wait for Flight Controller connection
+    while(not rospy.is_shutdown() and not current_state.connected):
+        rate.sleep()
+
+    pose = PoseStamped()
+
+    pose.pose.position.x = 0
+    pose.pose.position.y = 0
+    pose.pose.position.z = 2
+
+    # Send a few setpoints before starting
+    for i in range(100):
+        if(rospy.is_shutdown()):
+            break
+
+        local_pos_pub.publish(pose)
+        rate.sleep()
+
+    offb_set_mode = SetModeRequest()
+    offb_set_mode.custom_mode = 'OFFBOARD'
+
+    arm_cmd = CommandBoolRequest()
+    arm_cmd.value = True
+
+    last_req = rospy.Time.now()
+
+    first = True
+    
+    rotate_by = 0
+    
+    Graph = []
+
+    while(not rospy.is_shutdown()):
+        # First set the mode to offboard (refer to PX4 Flight Modes)
+        if(current_state.mode != "OFFBOARD" and (rospy.Time.now() - last_req) > rospy.Duration(5.0)):
+            if(set_mode_client.call(offb_set_mode).mode_sent == True):
+                rospy.loginfo("OFFBOARD enabled")
+
+            last_req = rospy.Time.now()
+
+        # Armed the vehicle
+        elif(not current_state.armed and (rospy.Time.now() - last_req) > rospy.Duration(5.0)):
+            if(arming_client.call(arm_cmd).success == True):
+                rospy.loginfo("Vehicle armed")
+
+            time.sleep(5) # Wait for 5 seconds after arming for takeoff
+
+            last_req = rospy.Time.now()
+
+        # Move the vehicle
+        elif(current_state.armed and (rospy.Time.now() - last_req) > rospy.Duration(5.0)):
+            if first:
+                # rospy.loginfo(type(image_subscriber.image_sub))
+                Graph.append(Graph_node(0, [pose.pose.position.x , pose.pose.orientation.y], []))
+                pose.pose.orientation = Quat([0, 0, 0])
+                first = False
+                
+            else:
+                # if pose.pose.orientation == Quat([0, 0, 0]):
+                # pose.pose.orientation = Quat([0, 0, rotate_by])
+                rospy.loginfo("Rotating Back")
+                # rotate_by += math.pi/18
+                # else:
+                #     pose.pose.orientation = Quat([0, 0, 0])
+
+                #     rospy.loginfo("Roatating")
+                if(pose.pose.position == [0,0,0]):
+                    rospy.loginfo("Roatating")
+
+            last_req = rospy.Time.now()
+
+
+        local_pos_pub.publish(pose)
+
+        rate.sleep()
+
